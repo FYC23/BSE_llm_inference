@@ -1,0 +1,10 @@
+{
+  "note": "HF fp32 reference computed in a separate process (check_split.py); else identical to notebook \u00a76",
+  "fp32_max_abs_diff": 5.91278076171875e-05,
+  "fp32_top1_agree": 1.0,
+  "bf16_max_abs_diff": 0.3296208381652832,
+  "bf16_top1_agree": 0.9166666666666666,
+  "ref_logit_std": 3.8160240650177,
+  "greedy_text": "The capital of France is Paris. The capital of Japan is Tokyo. The capital of Germany is Berlin. The capital of",
+  "first_token_matches_hf": true
+}

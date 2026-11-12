@@ -4,3 +4,10 @@ __pycache__/
 # local smoke-test outputs; commit only results/full/ (the full run on the 3090)
 results/smoke*/
 results/*.zip
+
+# planning notes (kept locally, not committed)
+PLAN.md
+RUN_PLAN.md
+results/*.log
+# raw profiler dumps are >100 MB (GitHub limit); the .trace.json.gz next to them is committed
+results/full/traces/**/*.xplane.pb

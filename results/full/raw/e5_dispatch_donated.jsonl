@@ -1,0 +1,3 @@
+{"B": 64, "S": 256, "steps": 32, "repeats": 3, "attn_impl": "grouped", "status": "ok", "step_ms_median": 26.215996345854364, "step_ms_p25": 25.29838154441677, "step_ms_p75": 26.236087302095257, "exp": "e5_dispatch_donated"}
+{"B": 1, "S": 1024, "steps": 32, "repeats": 3, "attn_impl": "grouped", "status": "ok", "step_ms_median": 15.290045412257314, "step_ms_p25": 15.131055188248865, "step_ms_p75": 16.013468717574142, "exp": "e5_dispatch_donated"}
+{"B": 16, "S": 1024, "steps": 32, "repeats": 3, "attn_impl": "grouped", "status": "ok", "step_ms_median": 18.454710938385688, "step_ms_p25": 18.0002741763019, "step_ms_p75": 19.060788697970565, "exp": "e5_dispatch_donated"}

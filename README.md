@@ -11,8 +11,8 @@ length move that boundary?
 - **Hardware:** one NVIDIA RTX 3090 (24 GB GDDR6X) on a Linux lab server, JAX on CUDA
   (`jax[cuda12]`).
 - **Theory:** the [Scaling Book inference chapter](https://jax-ml.github.io/scaling-book/inference/)
-  adapted to Qwen3-4B on a 3090. See [PLAN.md](PLAN.md) for the derivation, hypotheses and
-  experiment design.
+  adapted to Qwen3-4B on a 3090. See the [technical report](report/report.md) for the derivation,
+  hypotheses, results and figures.
 
 ## Repository layout
 
@@ -20,10 +20,11 @@ length move that boundary?
 |---|---|
 | `notebooks/qwen3_batch_scaling.ipynb` | **the whole experiment**: theory, model, correctness check, sweeps E0–E5, figures |
 | `notebooks/qwen3_batch_scaling.py` | the same notebook as a [jupytext](https://jupytext.readthedocs.io/) script (readable diffs). Edit this, then run `jupytext --sync notebooks/qwen3_batch_scaling.py` |
-| `PLAN.md` | research plan: theory, hypotheses H1–H6, experiments, run time estimate |
 | `requirements-local.txt` | pinned versions (JAX 0.12.0.1 with CUDA 12) |
 | `results/full/` | full-mode results (`raw/*.jsonl` + `.csv`, `env.json`, `figures/`, `traces/`) |
-| `report/` | technical report |
+| `report/report.md`, `report/report.pdf` | technical report |
+| `run_experiments.sh` | smoke test, then the full run, on one GPU (`GPU=<index> bash run_experiments.sh`) |
+| `check_split.py` | the E-check in two processes, for servers with less than ~40 GB of free host RAM |
 
 ## Setup on the GPU server
 
@@ -127,5 +128,6 @@ To regenerate figures from saved results, open the notebook with `OUT_DIR` point
   - Each device holds exactly 1/8 of the weights and cache.
 - **Memory accounting:** XLA's argument bytes equal the theory's `weights + B·S·KV_per_token`.
   Donation aliases the whole cache, so there are no hidden copies.
-- **Not yet run:** anything in full mode (Qwen3-4B), and the current version of the notebook
-  (with the 95% memory fraction and the larger batch grid) has not yet run on the 3090.
+- **Full run** (Qwen3-4B) completed on an RTX 3090 on 2026-11-12, in about 40 min. The Qwen3-4B
+  E-check passed (fp32 max |Δlogit| 5.9e-5) with `check_split.py`. See the
+  [technical report](report/report.md).
