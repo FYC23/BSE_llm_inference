@@ -1,6 +1,6 @@
-# Local development / verification environment (tested 2026-11-08, Python 3.12).
-# On Kaggle TPU only jax[tpu], safetensors, huggingface_hub, pandas, matplotlib are needed;
-# the notebook installs anything missing.
+# Environment for the RTX 3090 lab server and local checks (pins tested locally 2026-11-08, Python 3.12).
+# The notebook needs jax, safetensors, huggingface_hub, pandas, matplotlib; torch + transformers
+# only for the correctness reference.
 #
 #   uv venv .venv --python 3.12 && source .venv/bin/activate
 #   uv pip install -r requirements-local.txt

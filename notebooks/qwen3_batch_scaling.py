@@ -5,6 +5,8 @@
 #     text_representation:
 #       extension: .py
 #       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.6
 #   kernelspec:
 #     display_name: Python 3
 #     language: python
@@ -12,29 +14,26 @@
 # ---
 
 # %% [markdown]
-# # Batch scaling of Qwen3-4B inference on TPU v5e
+# # Batch scaling of Qwen3-4B inference on a single RTX 3090
 #
 # **Research question.** How does batch size trade off latency, throughput and memory during
-# inference, and when does decoding become compute-bound vs memory-bound? How do context length
-# and the number of chips move that boundary?
+# inference, and when does decoding become compute-bound vs memory-bound? How does context length
+# move that boundary?
 #
 # **What this notebook does.** It loads Qwen3-4B weights straight from the Hugging Face Hub and runs
 # them through a minimal JAX implementation of the Qwen3 forward pass, so every FLOP and byte
 # maps onto the theory from the
 # [Scaling Book inference chapter](https://jax-ml.github.io/scaling-book/inference/). It then sweeps
-# batch size × context length and records step time, memory and XLA's own FLOP/byte counts.
+# batch size × context length on one NVIDIA RTX 3090 (24 GB, JAX on CUDA) and records step time,
+# memory and XLA's own FLOP/byte counts.
 #
-# **How to run.**
-# * Locally: `RUN_MODE=smoke` (Qwen3-0.6B, tiny grids) on CPU/GPU to check every code path.
-# * On Kaggle: *File → Import Notebook*, Accelerator = **TPU v5e-8**, Internet **on**.
-#   1. Run once with `RUN_MODE = "smoke"` (~10 min).
-#   2. Set `RUN_MODE = "full"` and use *Save Version → Save & Run All* so `/kaggle/working`
-#      is kept as versioned output.
-#   3. Download `results.zip` from the output tab.
-#   4. **Stop the session afterwards**, because idle TPU time still uses quota.
+# **How to run** (see the README for the exact commands).
+# * `RUN_MODE=smoke` (Qwen3-0.6B, tiny grids, ~10 min) on CPU or GPU checks every code path.
+# * `RUN_MODE=full` (Qwen3-4B, real grids) on the 3090, headless with
+#   `jupyter nbconvert --execute` inside tmux. Results land in `results/full/`.
 #
-# Each experiment appends rows to a CSV as it goes, and a re-run skips finished rows, so a session
-# that dies halfway can be resumed.
+# Each experiment appends rows to a results file as it goes, and a re-run skips finished rows, so a
+# run that dies halfway can be resumed.
 
 # %% [markdown]
 # ## 1. Configuration
@@ -48,21 +47,33 @@ RUN_MODE = os.environ.get("RUN_MODE", "smoke")
 # Which experiments to run (all are resumable / idempotent).
 RUN_CHECK = os.environ.get("RUN_CHECK", "1") == "1"      # E-check: logits vs Hugging Face
 RUN_E0 = True    # measured FLOP/s and bandwidth ceilings
-RUN_E1 = True    # decode step: batch x context sweep, 1 chip
+RUN_E1 = True    # decode step: batch x context sweep, 1 device
 RUN_E2 = True    # prefill sweep
 RUN_E3 = True    # end-to-end requests (prefill + generation)
 RUN_E4 = True    # attention share (no-attention ablation) + XLA cost analysis + profiler trace
 RUN_E5 = True    # implementation ablations (repeat_kv, dispatch, buffer donation)
-RUN_E6 = True    # 8-chip tensor parallel (only runs if >= 8 devices)
+# Optional extension, not part of the single-GPU experiment: 8-device tensor parallel. Only runs
+# with >= 8 devices (e.g. FAKE_CPU_DEVICES=8 RUN_E6=1 to test the code path on a CPU).
+RUN_E6 = os.environ.get("RUN_E6", "0") == "1"
 
-# Local testing only: pretend the CPU has N devices so the tensor-parallel code path can be
-# exercised without a TPU. Must be set before JAX is imported.
+# Testing only: pretend the CPU has N devices so the tensor-parallel code path can be exercised
+# without multiple accelerators. Must be set before JAX is imported.
 FAKE_CPU_DEVICES = int(os.environ.get("FAKE_CPU_DEVICES", "0"))
 if FAKE_CPU_DEVICES:
     os.environ["JAX_PLATFORMS"] = "cpu"
     os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "")
                                + f" --xla_force_host_platform_device_count={FAKE_CPU_DEVICES}")
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")  # GPU only; harmless elsewhere
+
+# GPU memory (https://docs.jax.dev/en/latest/gpu_memory_allocation.html). By default JAX
+# preallocates 75% of GPU memory, and the BFC allocator caps usable memory at that fraction even
+# with PREALLOCATE=false, so a 24 GB card would report bytes_limit ~ 18 GiB and OOM early. We set
+# the fraction explicitly (fixed limit, no version-dependent growth) and keep preallocation on,
+# which the docs say fragments less than on-demand allocation: that matters because the sweeps
+# run right up to the OOM boundary. The remaining 5% covers the CUDA context and libraries outside
+# JAX's pool. bytes_limit (HBM_LIMIT below) then equals the real usable cap. These must be set
+# before JAX is imported; override them from the shell if the GPU is shared. CPU ignores them.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95")
 
 GRIDS = {
     "smoke": dict(
@@ -78,7 +89,9 @@ GRIDS = {
     ),
     "full": dict(
         model="Qwen/Qwen3-4B",
-        decode_B=[1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256, 288, 320, 384, 448, 512],
+        # dense around the spec B_crit (~76 on a 3090); 640-896 reach the S=128 OOM wall (~870)
+        decode_B=[1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256, 288, 320, 384, 448, 512,
+                  640, 768, 896],
         decode_S=[128, 256, 512, 1024, 2048, 4096],
         prefill_B=[1, 2, 4, 8, 16, 32, 64], prefill_T=[128, 512, 2048],
         e2e_B=[1, 4, 16, 32, 48], e2e_prompt=512, e2e_gen=256,
@@ -94,19 +107,17 @@ G = GRIDS[RUN_MODE]
 MODEL_ID = os.environ.get("MODEL_ID", G["model"])
 DTYPE_NAME = "bfloat16"
 
-ON_KAGGLE = os.path.isdir("/kaggle/working")
-OUT_DIR = os.path.abspath("/kaggle/working/results" if ON_KAGGLE
-                          else os.environ.get("OUT_DIR", f"../results/{RUN_MODE}"))
+OUT_DIR = os.path.abspath(os.environ.get("OUT_DIR", f"../results/{RUN_MODE}"))
 RAW_DIR = os.path.join(OUT_DIR, "raw")
 FIG_DIR = os.path.join(OUT_DIR, "figures")
 for d in (RAW_DIR, FIG_DIR):
     os.makedirs(d, exist_ok=True)
-print(f"RUN_MODE={RUN_MODE}  MODEL_ID={MODEL_ID}  ON_KAGGLE={ON_KAGGLE}\nOUT_DIR={OUT_DIR}")
+print(f"RUN_MODE={RUN_MODE}  MODEL_ID={MODEL_ID}\nOUT_DIR={OUT_DIR}")
 
 # %% [markdown]
 # ## 2. Environment
-# Installs only what is missing. On Kaggle TPU images JAX may already be present. If `jax[tpu]` gets
-# installed here, restart the kernel once and re-run.
+# Installs the small pure-Python dependencies if they are missing. JAX itself must already be
+# installed (`jax[cuda12]` for the GPU, see `requirements-local.txt`).
 
 # %%
 import importlib
@@ -122,8 +133,6 @@ def ensure(module, pip_spec):
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pip_spec])
 
 
-if ON_KAGGLE:
-    ensure("jax", "jax[tpu]")
 for mod, spec in [("safetensors", "safetensors"), ("huggingface_hub", "huggingface_hub"),
                   ("pandas", "pandas"), ("matplotlib", "matplotlib")]:
     ensure(mod, spec)
@@ -151,17 +160,16 @@ warnings.filterwarnings("ignore", message=".*Some donated buffers.*")
 
 DTYPE = jnp.dtype(DTYPE_NAME)
 DEVICES = jax.devices()
-if ON_KAGGLE and DEVICES[0].platform != "tpu":
-    raise RuntimeError(
-        f"JAX sees {DEVICES} instead of the TPU. Check Settings -> Accelerator = TPU v5e-8, then run "
-        "`pip install -U 'jax[tpu]'` in a cell, restart the kernel and re-run.")
+if RUN_MODE == "full" and DEVICES[0].platform == "cpu":
+    raise RuntimeError(f"JAX sees only {DEVICES}. Full mode needs an accelerator: install "
+                       "jax[cuda12] (requirements-local.txt) and check `nvidia-smi`.")
 DEV0 = DEVICES[0]
 CPU = jax.devices("cpu")[0]
 
 
 def versions():
     out = {"python": platform.python_version(), "jax": jax.__version__}
-    for m in ("jaxlib", "libtpu", "safetensors", "huggingface_hub", "transformers", "torch"):
+    for m in ("jaxlib", "jax_cuda12_plugin", "safetensors", "huggingface_hub", "transformers", "torch"):
         try:
             out[m] = importlib.import_module(m).__version__
         except Exception:
@@ -170,8 +178,11 @@ def versions():
 
 
 ENV = dict(
-    run_mode=RUN_MODE, model_id=MODEL_ID, dtype=DTYPE_NAME, on_kaggle=ON_KAGGLE,
+    run_mode=RUN_MODE, model_id=MODEL_ID, dtype=DTYPE_NAME,
     platform=DEV0.platform, device_kind=DEV0.device_kind, n_devices=len(DEVICES),
+    xla_env={k: os.environ.get(k) for k in ("XLA_PYTHON_CLIENT_PREALLOCATE",
+                                            "XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_FLAGS",
+                                            "CUDA_VISIBLE_DEVICES")},
     host=platform.node(), time_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     **versions(),
 )
@@ -181,9 +192,12 @@ print(json.dumps(ENV, indent=2))
 
 # %% [markdown]
 # ## 3. Hardware specs
-# The TPU v5e numbers come from the
-# [Scaling Book, "TPU specs"](https://jax-ml.github.io/scaling-book/tpus/#tpu-specs). E0 measures
-# what the chip actually achieves, and the theory below is evaluated with both.
+# The RTX 3090 numbers are nominal spec-sheet values (NVIDIA Ampere GA102 whitepaper: 936 GB/s
+# GDDR6X, 71 TFLOP/s dense bf16 tensor-core math with fp32 accumulate). Real clocks and achievable
+# throughput differ, so E0 measures what the card actually achieves, and the theory below is
+# evaluated with both. The TPU v5e row (from the
+# [Scaling Book, "TPU specs"](https://jax-ml.github.io/scaling-book/tpus/#tpu-specs)) is kept so
+# the notebook stays device-generic. The code says "HBM" for device memory whatever its type.
 
 # %%
 HW_SPECS = {
@@ -192,7 +206,7 @@ HW_SPECS = {
                     source="Scaling Book, TPU specs"),
     "rtx3090": dict(label="RTX 3090", hbm_bytes=24 * 2**30, hbm_bw=9.36e11, bf16_flops=7.1e13,
                     int8_ops=None, ici_oneway_per_link=None,
-                    source="NVIDIA spec sheet (bf16 dense, fp32 accumulate)"),
+                    source="NVIDIA GA102 whitepaper (nominal; bf16 dense, fp32 accumulate)"),
     "other": dict(label=DEV0.device_kind, hbm_bytes=None, hbm_bw=None, bf16_flops=None,
                   int8_ops=None, ici_oneway_per_link=None, source="none: use E0 measurements"),
 }
@@ -209,9 +223,6 @@ def detect_hw(dev):
 
 HW_KEY = detect_hw(DEV0)
 SPEC = HW_SPECS[HW_KEY]
-if ON_KAGGLE and HW_KEY != "tpu_v5e":
-    print(f"WARNING: expected a TPU v5e, got {DEV0.device_kind!r}. Spec-based predictions are off;"
-          " measured ceilings (E0) still work.")
 B_CRIT_SPEC = SPEC["bf16_flops"] / SPEC["hbm_bw"] if SPEC["hbm_bw"] else float("nan")
 print(f"hardware: {HW_KEY} ({DEV0.device_kind}) x{len(DEVICES)}   spec B_crit = {B_CRIT_SPEC:.0f}")
 
@@ -224,7 +235,8 @@ def mem_stats(dev=DEV0):
 
 
 HBM_LIMIT = mem_stats().get("bytes_limit") or SPEC["hbm_bytes"]
-print("usable device memory (bytes_limit):", HBM_LIMIT)
+print("usable device memory (bytes_limit):", HBM_LIMIT,
+      f"({HBM_LIMIT / 2**30:.2f} GiB)" if HBM_LIMIT else "")
 
 # %% [markdown]
 # ## 4. Model config and theory
@@ -346,7 +358,7 @@ if SPEC["hbm_bw"]:
     for S in G["decode_S"]:
         print(f"  S={S:5d}: max batch before OOM ~ {max_batch(S):7.0f}   "
               f"KV-bandwidth throughput cap = {SPEC['hbm_bw']/(S*KV_PER_TOKEN):9.0f} tok/s")
-    PRED_SPEC = prediction_table([1, 16, 64, 128, 240, 512], G["decode_S"], SPEC["bf16_flops"], SPEC["hbm_bw"])
+    PRED_SPEC = prediction_table([1, 16, 64, 128, 256, 512], G["decode_S"], SPEC["bf16_flops"], SPEC["hbm_bw"])
     PRED_SPEC.to_csv(os.path.join(RAW_DIR, "theory_spec_predictions.csv"), index=False)
     try:
         from IPython.display import display
@@ -478,7 +490,7 @@ def decode_loop(params, tok, cache, pos, n_steps, *, cfg, attn_impl="grouped", a
 # %% [markdown]
 # ### Loading weights from Hugging Face safetensors
 # Tensors are read and stacked on the host CPU first, then placed on the accelerator. This avoids
-# holding two copies of the weights on a 16 GiB chip.
+# holding two copies of the weights in device memory.
 
 # %%
 from safetensors import safe_open
@@ -516,7 +528,7 @@ def load_params_host(model_dir, cfg, dtype):
     return params
 
 
-CACHE_TP_SPEC = P(None, "tp", None, None)  # [B, K, S, H]: one KV head per chip when K = 8
+CACHE_TP_SPEC = P(None, "tp", None, None)  # [B, K, S, H]: one KV head per device when K = 8
 
 
 def tp_param_specs(cfg):
@@ -559,8 +571,9 @@ print("on device:", DEV0, "| bytes_in_use:", mem_stats().get("bytes_in_use"))
 #    (top-1 agreement and the size of the gap).
 # 3. **Sanity check.** A short greedy generation decoded to text.
 #
-# Needs `torch` and `transformers` on the host. If they are missing, step 1 is skipped. The exact
-# check is most useful locally; on Kaggle it costs a few CPU minutes of session time.
+# Needs `torch` and `transformers` on the host. If they are missing, step 1 is skipped. For
+# Qwen3-4B the fp32 CPU check needs roughly 40 GB of host RAM and a few CPU minutes; set
+# `RUN_CHECK=0` to skip it.
 
 # %%
 def new_cache(B, S, cfg=CFG, dtype=DTYPE, sharding=None, device=None):
@@ -734,6 +747,9 @@ def bench_decode(B, S, steps, repeats, params=None, attn_impl="grouped", mesh=No
     row.update(theory_flops=th["flops"], theory_bytes=th["bytes"], theory_bytes_kv=th["bytes_kv"],
                theory_mem_bytes=memory_theory(B, S))
     cache = tok = None
+    # peak_bytes_in_use is a process-wide high-water mark that never resets. It is this condition's
+    # true peak only if the condition raised it (peak_is_new); otherwise it is just an upper bound.
+    peak_before = mem_stats().get("peak_bytes_in_use")
     try:
         cache = new_cache(B, S, sharding=cache_sh)
         tok = jnp.zeros((B, 1), jnp.int32)
@@ -756,7 +772,9 @@ def bench_decode(B, S, steps, repeats, params=None, attn_impl="grouped", mesh=No
             return params, state["tok"], state["cache"], pos
 
         stats, out = timed_runs(compiled, args_fn, repeats, steps)
-        row.update(stats, status="ok", peak_bytes_in_use=mem_stats().get("peak_bytes_in_use"))
+        peak = mem_stats().get("peak_bytes_in_use")
+        row.update(stats, status="ok", peak_bytes_in_use=peak,
+                   peak_is_new=bool(peak is not None and peak_before is not None and peak > peak_before))
         del out, state
     except Exception as e:
         if not is_oom(e):
@@ -795,8 +813,8 @@ def sweep(name, grid, run_one, key_cols=("B", "S")):
 
 # %% [markdown]
 # ## 8. E0: measured ceilings
-# Achievable bf16 matmul FLOP/s and HBM bandwidth on one chip. These replace the spec numbers when
-# fitting the step-time models.
+# Achievable bf16 matmul FLOP/s and device-memory bandwidth on one device. These replace the
+# nominal spec numbers when fitting the step-time models.
 
 # %%
 def e0_ceilings():
@@ -848,7 +866,7 @@ if RUN_E0:
              if SPEC["hbm_bw"] else ""))
 
 # %% [markdown]
-# ## 9. E1: decode step, batch × context, 1 chip
+# ## 9. E1: decode step, batch × context, 1 device
 # The headline sweep. For each context S we allocate a cache of length S and time steps at position
 # S−1, so every sequence attends to exactly S positions. E3 checks this shortcut against real
 # generation.
@@ -1052,11 +1070,14 @@ if RUN_E5:
         sweep(name, pts, fn)
 
 # %% [markdown]
-# ## 14. E6: tensor parallel over 8 chips
-# The weights are split Megatron-style across 8 devices:
+# ## 14. Optional extension, E6: tensor parallel over 8 devices
+# **Not part of the single-GPU experiment.** It is off by default (`RUN_E6=1` enables it) and only
+# runs with at least 8 devices. On one machine it can be exercised on 8 fake CPU devices
+# (`FAKE_CPU_DEVICES=8 RUN_E6=1`) to check that the sharded code path still matches the
+# single-device model. The weights are split Megatron-style across 8 devices:
 # * Q/K/V/gate/up are split by columns and O/down by rows.
 # * The vocabulary is split for the embedding and unembedding.
-# * The KV cache is split by KV head. With K = 8, each chip holds exactly one KV head.
+# * The KV cache is split by KV head. With K = 8, each device holds exactly one KV head.
 #
 # Each layer then needs two all-reduces, so 72 collectives per decode step.
 
@@ -1087,6 +1108,8 @@ if RUN_E6 and len(DEVICES) >= 8:
                    "top1_equal": bool(tp_np[0, -1].argmax() == one_np[0, -1].argmax())}, f)
 elif RUN_E6:
     print(f"E6 skipped: needs 8 devices, have {len(DEVICES)}")
+else:
+    print("E6 (optional 8-device extension) disabled; set RUN_E6=1 to enable")
 
 # %% [markdown]
 # ## 15. Figures
@@ -1228,18 +1251,26 @@ def make_figures():
         ax.plot(d.intensity, d.achieved / 1e12, "o", color=col[S], label=f"S = {S}", mec="white", mew=0.8)
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("arithmetic intensity (theory FLOPs / theory HBM bytes)")
+    ax.set_xlabel("arithmetic intensity (theory FLOPs / theory device-memory bytes)")
     ax.set_ylabel("achieved TFLOP/s (theory FLOPs / measured time)")
     ax.set_title("Empirical roofline of the decode step")
     ax.legend(fontsize=8, ncol=2)
     save(fig, "fig3_roofline.png")
 
-    # Fig 4: memory vs batch
+    # Fig 4: memory vs batch. Dots: XLA's compiled footprint of the timed program (arguments incl.
+    # weights and cache, + outputs not aliased to donated inputs, + temporaries such as activations
+    # and logits). Diamonds: measured allocator peak, only where the condition set a new
+    # process-wide high-water mark (otherwise peak_bytes_in_use belongs to an earlier condition).
     fig, ax = plt.subplots(figsize=(6.4, 4.2))
     for S in Ss:
         d = ok[ok.S == S].sort_values("B")
-        if "bytes_in_use_after_alloc" in d and d.bytes_in_use_after_alloc.notna().any():
-            ax.plot(d.B, d.bytes_in_use_after_alloc / 2**30, "o", color=col[S], label=f"S = {S} measured")
+        if "xla_arg_bytes" in d and d.xla_arg_bytes.notna().any():
+            foot = (d.xla_arg_bytes + d.xla_out_bytes.fillna(0) - d.xla_alias_bytes.fillna(0)
+                    + d.xla_temp_bytes.fillna(0))
+            ax.plot(d.B, foot / 2**30, "o", color=col[S], label=f"S = {S}")
+        if "peak_is_new" in d:
+            pk = d[d.peak_is_new.fillna(False).astype(bool) & d.peak_bytes_in_use.notna()]
+            ax.plot(pk.B, pk.peak_bytes_in_use / 2**30, "D", color=col[S], mfc="none", ms=8, mew=1.2)
         Bs = np.unique(np.concatenate([d.B.values, oom[oom.S == S].B.values]))
         ax.plot(Bs, [memory_theory(B, S) / 2**30 for B in Bs], "-", color=col[S], lw=1)
         for _, r in oom[oom.S == S].iterrows():
@@ -1251,8 +1282,9 @@ def make_figures():
     ax.set_xscale("log", base=2)
     ax.set_xlabel("batch size B")
     ax.set_ylabel("GiB")
-    ax.set_title("Device memory vs batch size", pad=16)
-    ax.text(0, 1.01, "lines = weights + B·S·KV_per_token, dots = measured, × = out of memory",
+    ax.set_title("Device memory vs batch size", pad=28)
+    ax.text(0, 1.01, "lines = weights + B·S·KV_per_token, dots = XLA compiled footprint (args + temp),\n"
+            "◇ = measured allocator peak (new high-water marks only), × = out of memory",
             transform=ax.transAxes, fontsize=7.5, color=MUTED, va="bottom")
     ax.legend(fontsize=7, ncol=2)
     save(fig, "fig4_memory_vs_batch.png")
@@ -1290,8 +1322,14 @@ def make_figures():
     a2.legend(fontsize=8)
     save(fig, "fig5_attention_share_and_model_fit.png")
 
-    # Fig 6: ablations + tensor parallel
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 4))
+    # Fig 6: ablations (+ the optional tensor-parallel panel only when E6 data exists)
+    e6 = load("e6_tp8")
+    e6 = e6[e6.status == "ok"] if e6 is not None else None
+    has_tp = e6 is not None and len(e6) > 0
+    if has_tp:
+        fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 4))
+    else:
+        fig, a1 = plt.subplots(figsize=(6.4, 4.2))
     names = [("e1_decode", "grouped GQA, fused loop"), ("e5_repeat_kv", "repeat_kv GQA"),
              ("e5_dispatch_donated", "per-step dispatch"), ("e5_dispatch_copy", "per-step, no donation")]
     pts = G["ablation_points"]
@@ -1306,27 +1344,25 @@ def make_figures():
     a1.set_xticks(np.arange(len(pts)) + width * (len(names) - 1) / 2)
     a1.set_xticklabels([f"B={B}\nS={S}" for B, S in pts])
     a1.set_ylabel("decode step time (ms)")
-    a1.set_title("(a) Implementation ablations (lower is better)")
+    a1.set_title(("(a) " if has_tp else "") + "Implementation ablations (lower is better)")
     a1.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=2)
-    e6 = load("e6_tp8")
-    if e6 is not None:
-        e6 = e6[e6.status == "ok"]
+    if not has_tp:
+        save(fig, "fig6_ablations.png")
+    else:
         for S in sorted(e6.S.unique()):
             c = col.get(S, MUTED)
             d6 = e6[e6.S == S].sort_values("B")
-            a2.plot(d6.B, d6.B / (d6.step_ms_median / 1e3), "-o", color=c, label=f"8 chips, S = {S}")
+            a2.plot(d6.B, d6.B / (d6.step_ms_median / 1e3), "-o", color=c, label=f"8 devices, S = {S}")
             d1 = ok[ok.S == S].sort_values("B")
             if len(d1):
-                a2.plot(d1.B, d1.tok_s, ":", color=c, lw=1.5, label=f"1 chip, S = {S}")
+                a2.plot(d1.B, d1.tok_s, ":", color=c, lw=1.5, label=f"1 device, S = {S}")
         a2.set_xscale("log", base=2)
         a2.set_yscale("log")
         a2.legend(fontsize=7)
-    else:
-        a2.text(0.5, 0.5, "no TP-8 data", ha="center", transform=a2.transAxes, color=MUTED)
-    a2.set_xlabel("batch size B")
-    a2.set_ylabel("throughput (tokens / s)")
-    a2.set_title("(b) 1 chip vs 8-chip tensor parallel")
-    save(fig, "fig6_ablations_and_tp.png")
+        a2.set_xlabel("batch size B")
+        a2.set_ylabel("throughput (tokens / s)")
+        a2.set_title("(b) 1 device vs 8-device tensor parallel (optional extension)")
+        save(fig, "fig6_ablations_and_tp.png")
 
     # summary table for the report
     summ = ok[["S", "B", "step_ms_median", "pred_A_ms", "pred_B_ms", "tok_s"]].copy()
@@ -1340,8 +1376,9 @@ make_figures()
 
 # %% [markdown]
 # ## 16. Package the outputs
-# Download `results.zip` from Kaggle's output tab, unzip it into `results/full/` in the repo, and
-# re-run section 15 locally if needed.
+# Everything is already in `OUT_DIR` (`results/full/` for a full run). This adds CSV copies of the
+# raw files and a `results_<mode>.zip` next to `OUT_DIR` (git-ignored) for copying the results off
+# the server; section 15 can be re-run anywhere from the unzipped files.
 
 # %%
 import shutil

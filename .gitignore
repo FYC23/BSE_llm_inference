@@ -1,6 +1,6 @@
 .venv/
 __pycache__/
 .ipynb_checkpoints/
-# local smoke-test outputs; commit only results/full/ (downloaded from Kaggle)
+# local smoke-test outputs; commit only results/full/ (the full run on the 3090)
 results/smoke*/
 results/*.zip
